@@ -177,3 +177,4 @@ class MainRecommender:
 
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
         return res
+    
