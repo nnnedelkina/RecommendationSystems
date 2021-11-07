@@ -11,7 +11,7 @@ from implicit.nearest_neighbours import bm25_weight, tfidf_weight
 
 # Модель второго уровня
 from lightgbm import LGBMClassifier
-
+from catboost import CatBoostClassifier
 
 class Recommender:
     """Рекоммендации, которые можно получить из ALS
@@ -22,7 +22,7 @@ class Recommender:
         Матрица взаимодействий user-item
     """
 
-    def __init__(self, data, user_features, item_features, weighting=True, n_lvl_2_train_weeks=4, n_lvl_2_candidates=50):
+    def __init__(self, data, user_features, item_features, weighting=True, n_lvl_2_train_weeks=4, n_lvl_2_train_candidates=20, n_lvl_2_predict_candidates=20):
 
         # Топ покупок каждого юзера
         self.top_purchases = data.groupby(['user_id', 'item_id'])['quantity'].count().reset_index()
@@ -47,7 +47,7 @@ class Recommender:
 
         self.als_recommender = self.fit_als_recommender(self.user_item_matrix)
         self.own_recommender = self.fit_own_recommender(self.user_item_matrix)
-        self.fit_lvl_2_recommender(n_train_weeks=n_lvl_2_train_weeks, n_candidates=n_lvl_2_candidates)
+        self.fit_lvl_2_recommender(n_train_weeks=n_lvl_2_train_weeks, n_train_candidates=n_lvl_2_train_candidates, n_predict_candidates=n_lvl_2_predict_candidates)
         
     @staticmethod
     def _prepare_matrix(data):
@@ -202,64 +202,66 @@ class Recommender:
         return r
 
     
-    def add_features(self, ds):
-
+    def add_features(self, ds, data=None):
+        if data is None:
+            data = self.data
+            
         ds = ds.merge(self.item_features, on='item_id', how='left')
         ds = ds.merge(self.user_features, on='user_id', how='left')
-        ds = ds.merge(self.data, on=['user_id', 'item_id'], how='left')
+#        ds = ds.merge(data, on=['user_id', 'item_id'], how='left')
 
         ds = ds.groupby(['user_id', 'item_id']).first().reset_index()
 
-        baskets_by_user = self.data.groupby('user_id')['basket_id'].nunique().reset_index().rename(
+        baskets_by_user = data.groupby('user_id')['basket_id'].nunique().reset_index().rename(
             columns={'basket_id': 'baskets_by_user'})
-        sales_value_by_user = self.data.groupby('user_id')['sales_value'].sum().reset_index().rename(
+        sales_value_by_user = data.groupby('user_id')['sales_value'].sum().reset_index().rename(
             columns={'sales_value': 'sales_value_by_user'})
 
         ds = ds.merge(baskets_by_user, on='user_id', how='left').merge(sales_value_by_user, on='user_id', how='left')
         ds['user_mean_check'] = ds['sales_value_by_user'] / ds['baskets_by_user'] 
 
-        train_with_features = self.data.merge(self.item_features, on='item_id', how='left')
+        data_with_items = data.merge(self.item_features, on='item_id', how='left')
 
-        quantity_by_user_commodity_desc = train_with_features.groupby(['user_id', 'commodity_desc'])['quantity'].sum().reset_index().rename(columns={'quantity': 'quantity_by_user_commodity_desc'})
+        quantity_by_user_commodity_desc = data_with_items.groupby(['user_id', 'commodity_desc'])['quantity'].sum().reset_index().rename(columns={'quantity': 'quantity_by_user_commodity_desc'})
         ds = ds.merge(quantity_by_user_commodity_desc, on=['user_id', 'commodity_desc'],
                       how='left').fillna({'quantity_by_user_commodity_desc':0})
 
-        weeks_by_user = self.data.groupby('user_id')['week_no'].nunique().reset_index().rename(columns={'week_no': 'weeks_by_user'})
+        weeks_by_user = data.groupby('user_id')['week_no'].nunique().reset_index().rename(columns={'week_no': 'weeks_by_user'})
         ds = ds.merge(weeks_by_user, on='user_id', how='left')
 
         ds['baskets_per_week_by_user'] = ds['baskets_by_user'] / ds['weeks_by_user'] 
 
-        weeks_by_item = self.data.groupby('item_id')['week_no'].nunique().reset_index().rename(columns={'week_no': 'weeks_by_item'})
-        quanity_by_item = self.data.groupby('item_id')['quantity'].sum().reset_index().rename(columns={'quantity': 'quantity_by_item'})
+        weeks_by_item = data.groupby('item_id')['week_no'].nunique().reset_index().rename(columns={'week_no': 'weeks_by_item'})
+        quanity_by_item = data.groupby('item_id')['quantity'].sum().reset_index().rename(columns={'quantity': 'quantity_by_item'})
         ds = ds.merge(weeks_by_item, on='item_id', how='left').merge(quanity_by_item, on='item_id', how='left')
 
         ds['quanity_per_week_by_item'] = ds['quantity_by_item'] / ds['weeks_by_item'] 
 
         cat_features = [f for f, t in zip(ds.dtypes.index, ds.dtypes) if t == 'object']    
         for c in cat_features:
-            ds[c] = ds[c].astype('category')
+            ds[c] = ds[c].fillna('').astype('category')
         return ds
 
     @staticmethod
     def filter_by_users(users, data):
         return data[data['user_id'].isin(users['user_id'].unique())]
     
-    def fit_lvl_2_recommender(self, n_train_weeks, n_candidates):
+    def fit_lvl_2_recommender(self, n_train_weeks, n_train_candidates, n_predict_candidates):
         """ Модель выбирает n_candidates товаров, купленных каждым пользователем,
             и отдает предпочтения товарам, похожим по lvl_2_model на купленные в течение последних n_train_weeks недель 
         """
         print('Подготовка 2-х уровневой модели ...')
         
         old, new = self.split_by_weeks(self.data, n_train_weeks)
- 
         print(f'Выделено {len(new)} из {len(self.data)} записей для {n_train_weeks} последних недель.')
-        print(f'Подготовка списка всех пользователей с кандидатами ({n_candidates} кандидатов для каждого пользователя) ...')
-        all_users_with_candidates = self.get_candidates(self.data, lambda x: self.get_recommendations(0, x, N=n_candidates))
-        print(f"Подготовлено {len(all_users_with_candidates)} записей {len(all_users_with_candidates['user_id'].unique())} пользователей с кандидатами.")
+
+        print(f'Обучение: подготовка списка всех пользователей с кандидатами ({n_train_candidates} кандидатов для каждого пользователя) ...')
+        all_users_with_candidates = self.get_candidates(self.data, lambda x: self.get_recommendations(0, x, N=n_train_candidates))
+        print(f"Обучение: подготовлено {len(all_users_with_candidates)} записей {len(all_users_with_candidates['user_id'].unique())} пользователей с кандидатами.")
     
-        print('Добавление признаков ...')
+        print('Обучение: добавление признаков ...')
         data_with_features = self.add_features(all_users_with_candidates)
-        print(f'Добавление признаков завершено, число записей: {len(data_with_features)} ...')
+        print(f'Обучение: добавление признаков завершено, число записей: {len(data_with_features)} ...')
     
         new_users_data = self.filter_by_users(new, data_with_features)
         print(f'Число записей для пользователей из {n_train_weeks} последних недель: {len(new_users_data)} ...')
@@ -272,18 +274,32 @@ class Recommender:
         print(f'Размер тренировочного набора: {len(targets)}')
         print(targets['target'].value_counts())
 
+       
+        cat_features = [f for f, t in zip(targets.dtypes.index, targets.dtypes) if str(t) == 'category']
+        print(f'Категориальные признаки: {cat_features}')
+
         X_train = targets.drop('target', axis=1)
         y_train = targets['target']
         
-        cat_features = [f for f, t in zip(targets.dtypes.index, targets.dtypes) if str(t) == 'category']
-        print(f'Категориальные признаки: {cat_features}')
         
-        print('Тренируем LGBMClassifier ...')
-        lgb = LGBMClassifier(objective='binary', max_depth=-1, num_leaves=2**16)
-        lgb.fit(X_train, y_train, categorical_feature=cat_features)
+        print('Тренируем модель 2го уровня ...')
+        model = LGBMClassifier(objective='binary', max_depth=-1, num_leaves=2**16)
+        model.fit(X_train, y_train, categorical_feature=cat_features)
+#        model = CatBoostClassifier()
+#        model.fit(X_train, y_train, cat_features=cat_features)
         
-        print('Готовим рекомендации LGBMClassifier ...')
-        data_with_features['lvl_2_score'] = lgb.predict_proba(data_with_features)[:,1]
+        print('Готовим рекомендации 2го уровня ...')
+
+        if n_predict_candidates != n_train_candidates:
+            print(f'Предсказания: подготовка списка всех пользователей с кандидатами ({n_predict_candidates} кандидатов для каждого пользователя) ...')
+            all_users_with_candidates = self.get_candidates(self.data, lambda x: self.get_recommendations(0, x, N=n_predict_candidates))
+            print(f"Предсказания: подготовлено {len(all_users_with_candidates)} записей {len(all_users_with_candidates['user_id'].unique())} пользователей с кандидатами.")
+    
+            print('Предсказания: добавление признаков ...')
+            data_with_features = self.add_features(all_users_with_candidates)
+            print(f'Предсказания: добавление признаков завершено, число записей: {len(data_with_features)} ...')
+    
+        data_with_features['lvl_2_score'] = model.predict_proba(data_with_features)[:,1]
         lvl_2_scores = data_with_features.groupby(['user_id', 'item_id'])['lvl_2_score'].mean().reset_index()
         self.lvl_2_recommendations = lvl_2_scores.groupby('user_id').apply(
             lambda x: x.sort_values('lvl_2_score', ascending=False)['item_id'].tolist())
